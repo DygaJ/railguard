@@ -81,6 +81,7 @@ pub fn handle(input: &HookInput, policy: &Policy) -> PreToolResult {
             state.warning_count = 0;
             state.block_history.clear();
             state.heightened_keywords.clear();
+            state.heightened_anchors.clear();
             let _ = state.save(&state_dir);
             // Fall through to normal evaluation
         } else {
@@ -141,7 +142,8 @@ pub fn handle(input: &HookInput, policy: &Policy) -> PreToolResult {
                 };
             } else {
                 let keywords = extract_keywords(&command);
-                state.record_block(&command, "behavioral-evasion", keywords, 3);
+                let anchors = state.heightened_anchors.clone();
+                state.record_block_anchored(&command, "behavioral-evasion", keywords, anchors, 3);
                 state.set_pending_approval(&pattern_key);
                 let _ = state.save(&state_dir);
 
@@ -295,7 +297,7 @@ pub fn handle(input: &HookInput, policy: &Policy) -> PreToolResult {
     if let Decision::Block { rule, message } = &decision {
         if tool_name == "Bash" && !command.is_empty() {
             let keywords = extract_keywords(&command);
-            state.record_block(&command, rule, keywords, 0);
+            record_policy_block(&mut state, policy, &command, rule, keywords);
         }
         let _ = state.save(&state_dir);
         log_decision(
@@ -504,7 +506,13 @@ pub fn handle(input: &HookInput, policy: &Policy) -> PreToolResult {
                     PathCheck::Allow => {}
                     PathCheck::Denied(reason) => {
                         let keywords = extract_keywords(cmd);
-                        state.record_block(cmd, "path-fence", keywords, 0);
+                        state.record_block_anchored(
+                            cmd,
+                            "path-fence",
+                            keywords,
+                            anchors_from(cmd, [path.clone()]),
+                            0,
+                        );
                         let _ = state.save(&state_dir);
                         log_decision(
                             input,
@@ -656,7 +664,7 @@ pub fn handle(input: &HookInput, policy: &Policy) -> PreToolResult {
             // Record block for behavioral tracking (Tier 3)
             if tool_name == "Bash" && !command.is_empty() {
                 let keywords = extract_keywords(&command);
-                state.record_block(&command, rule, keywords, 0);
+                record_policy_block(&mut state, policy, &command, rule, keywords);
             }
             let _ = state.save(&state_dir);
             log_decision(
@@ -1084,6 +1092,46 @@ fn rule_regex(policy: &Policy, name: &str) -> Option<Regex> {
         .and_then(|r| Regex::new(&r.pattern).ok())
 }
 
+/// Record a policy block for Tier 3, anchored on the words of the text the
+/// rule matched, over the same normalized variants the matcher uses.
+fn record_policy_block(
+    state: &mut SessionState,
+    policy: &Policy,
+    command: &str,
+    rule: &str,
+    keywords: Vec<String>,
+) {
+    let matched: Vec<String> = rule_regex(policy, rule)
+        .map(|re| {
+            evasion::normalize_command(command)
+                .iter()
+                .flat_map(|variant| {
+                    re.find_iter(variant)
+                        .map(|m| m.as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    state.record_block_anchored(command, rule, keywords, anchors_from(command, matched), 0);
+}
+
+/// Keywords of the `matched` texts that also occur in `command`: the words a
+/// retry must reuse to count as one. A word present only in an expanded or
+/// decoded variant cannot recur in a retry's raw text and is dropped, so such
+/// a block falls back to the keyword-only check.
+fn anchors_from(command: &str, matched: impl IntoIterator<Item = String>) -> Vec<String> {
+    let lower = command.to_lowercase();
+    let mut anchors: Vec<String> = matched
+        .into_iter()
+        .flat_map(|text| extract_keywords(&text))
+        .filter(|word| lower.contains(&word.to_lowercase()))
+        .collect();
+    anchors.sort();
+    anchors.dedup();
+    anchors
+}
+
 /// The settings tamper rule exists to stop writes. A mention of the settings
 /// path is inert when every raw segment the rule matches is read-only, after
 /// heredoc bodies that only reach data sinks are removed. So a grep for the
@@ -1328,5 +1376,33 @@ mod tests {
         assert!(has_substitution("cat `x`"));
         assert!(has_substitution("cat <(x)"));
         assert!(!has_substitution("cat \\`x"));
+    }
+
+    #[test]
+    fn anchors_are_matched_words_present_in_the_command() {
+        assert_eq!(
+            anchors_from("cat ~/.ssh/id_rsa", ["~/.ssh/id_rsa".to_string()]),
+            ["ssh/id_rsa"]
+        );
+        // Deduplicated and sorted.
+        assert_eq!(
+            anchors_from(
+                "terraform destroy; terraform destroy",
+                [
+                    "terraform destroy".to_string(),
+                    "terraform destroy".to_string()
+                ],
+            ),
+            ["destroy", "terraform"]
+        );
+        // Words only present in an expanded or decoded variant are dropped.
+        assert!(
+            anchors_from("cat $HOME/.ssh/id_rsa", ["/home/u/.ssh/id_rsa".to_string()]).is_empty()
+        );
+        assert!(anchors_from(
+            "echo dGVy | base64 -d | sh",
+            ["terraform destroy".to_string()]
+        )
+        .is_empty());
     }
 }
